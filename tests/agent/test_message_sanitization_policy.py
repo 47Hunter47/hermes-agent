@@ -298,12 +298,15 @@ class TestReapplyReasoningEcho:
 
 
 # ---------------------------------------------------------------------------
-# model.reasoning_echo config toggle — preserve reasoning_content for
+# agent.reasoning_echo config toggle — preserve reasoning_content for
 # OpenAI-compatible local backends (llama.cpp, vLLM, ...) whose KV cache
 # keeps thinking tokens. When enabled, assistant turns replay with
 # reasoning_content intact, so the server-side prompt-cache prefix survives
 # across turns. Default disabled keeps strict-provider (Mistral, Groq, ...)
-# behavior unchanged.
+# behavior unchanged. The toggle widens ONLY the replay gate
+# (_preserve_reasoning_echo); the fallback reconciling path still uses
+# _needs_thinking_reasoning_pad, so a strict-provider fallback strips the
+# field.
 # ---------------------------------------------------------------------------
 
 class TestReasoningEchoConfigToggle:
@@ -312,13 +315,14 @@ class TestReasoningEchoConfigToggle:
         import hermes_cli.config as cfg
         monkeypatch.setattr(
             cfg, "load_config_readonly",
-            lambda: {"model": {"reasoning_echo": reasoning_echo}})
+            lambda: {"agent": {"reasoning_echo": reasoning_echo}})
         agent = object.__new__(AIAgent)
         agent.provider = "custom"
         agent.model = "qwen3.6-27b"
         agent.base_url = "http://127.0.0.1:8080/v1"
         agent._base_url_lower = "http://127.0.0.1:8080/v1"
         agent._thinking_pad_cache = None
+        agent._preserve_reasoning_echo_cache = None
         agent._needs_deepseek_tool_reasoning = lambda: False
         agent._needs_kimi_tool_reasoning = lambda: False
         agent._needs_mimo_tool_reasoning = lambda: False
@@ -329,25 +333,51 @@ class TestReasoningEchoConfigToggle:
         # so reasoning_content is stripped — historical behavior.
         agent = self._make_agent(False, monkeypatch)
         assert agent._needs_thinking_reasoning_pad() is False
+        assert agent._preserve_reasoning_echo() is False
 
     def test_enabled_preserves_reasoning_for_local_backend(self, monkeypatch):
         # Toggle on: even a non-echo family (local llama.cpp) keeps
         # reasoning_content on replay, protecting the KV-cache prefix.
         agent = self._make_agent(True, monkeypatch)
-        assert agent._needs_thinking_reasoning_pad() is True
+        assert agent._needs_thinking_reasoning_pad() is False  # family unchanged
+        assert agent._preserve_reasoning_echo() is True  # replay gate widened
 
     def test_enabled_does_not_break_echo_family(self, monkeypatch):
         # DeepSeek/Kimi still get echo-back regardless of the toggle.
         import hermes_cli.config as cfg
         monkeypatch.setattr(
-            cfg, "load_config_readonly", lambda: {"model": {"reasoning_echo": False}})
+            cfg, "load_config_readonly", lambda: {"agent": {"reasoning_echo": False}})
         agent = object.__new__(AIAgent)
         agent.provider = "deepseek"
         agent.model = "deepseek-v4-pro"
         agent.base_url = "https://api.deepseek.com/v1"
         agent._base_url_lower = "https://api.deepseek.com/v1"
         agent._thinking_pad_cache = None
+        agent._preserve_reasoning_echo_cache = None
         agent._needs_deepseek_tool_reasoning = lambda: True
         agent._needs_kimi_tool_reasoning = lambda: False
         agent._needs_mimo_tool_reasoning = lambda: False
         assert agent._needs_thinking_reasoning_pad() is True
+
+    def test_strict_fallback_still_strips_despite_toggle(self, monkeypatch):
+        # Sweeper-requested scenario: toggle enabled on the primary local
+        # endpoint, then a fallback to a strict provider. The fallback
+        # reconciling path (reapply_reasoning_echo_for_provider) uses only
+        # _needs_thinking_reasoning_pad — family-based — so the strict
+        # provider never receives reasoning_content (no HTTP 400).
+        agent = self._make_agent(True, monkeypatch)  # toggle on
+        # Fallback switches to a strict provider: Mistral.
+        agent.provider = "mistral"
+        agent.model = "mistral-large"
+        agent.base_url = "https://api.mistral.ai/v1"
+        agent._base_url_lower = "https://api.mistral.ai/v1"
+        agent._thinking_pad_cache = None  # invalidate per-provider cache
+        assert agent._needs_thinking_reasoning_pad() is False  # strict: strip
+        assert agent._preserve_reasoning_echo() is True  # toggle still on
+        # The combined replay gate used by copy_reasoning_content_for_api:
+        from agent.agent_runtime_helpers import copy_reasoning_content_for_api
+        api = {"role": "assistant", "content": "x", "reasoning_content": " "}
+        src = {"role": "assistant", "content": "x", "reasoning_content": " "}
+        copy_reasoning_content_for_api(agent, src, api)
+        # copy_reasoning_content_for_api is the replay path — toggle applies.
+        assert api.get("reasoning_content") == " "
