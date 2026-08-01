@@ -6745,6 +6745,17 @@ class AIAgent:
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
         )
+        # model.reasoning_echo: user opt-in to preserve reasoning_content on
+        # replay for OpenAI-compatible local backends (llama.cpp, vLLM, ...)
+        # whose KV cache keeps thinking tokens. Stripping the field there
+        # breaks the prompt-cache prefix on every turn; keeping it lets long
+        # conversations hit the server-side cache. Default false.
+        if not result:
+            try:
+                from hermes_cli.config import load_config_readonly
+                result = bool((load_config_readonly().get("model") or {}).get("reasoning_echo"))
+            except Exception:
+                result = False
         self._thinking_pad_cache = (key, result)
         return result
 

@@ -21,6 +21,7 @@ from agent.message_sanitization import (
     reasoning_echo_family,
     uniquify_tool_call_ids,
 )
+from run_agent import AIAgent
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +295,59 @@ class TestReapplyReasoningEcho:
         assert reapply_reasoning_echo(msgs, True) == 0
         reapply_reasoning_echo(msgs, False)
         assert reapply_reasoning_echo(msgs, False) == 0
+
+
+# ---------------------------------------------------------------------------
+# model.reasoning_echo config toggle — preserve reasoning_content for
+# OpenAI-compatible local backends (llama.cpp, vLLM, ...) whose KV cache
+# keeps thinking tokens. When enabled, assistant turns replay with
+# reasoning_content intact, so the server-side prompt-cache prefix survives
+# across turns. Default disabled keeps strict-provider (Mistral, Groq, ...)
+# behavior unchanged.
+# ---------------------------------------------------------------------------
+
+class TestReasoningEchoConfigToggle:
+    def _make_agent(self, reasoning_echo, monkeypatch):
+        """Build an AIAgent-shaped object without a full init."""
+        import hermes_cli.config as cfg
+        monkeypatch.setattr(
+            cfg, "load_config_readonly",
+            lambda: {"model": {"reasoning_echo": reasoning_echo}})
+        agent = object.__new__(AIAgent)
+        agent.provider = "custom"
+        agent.model = "qwen3.6-27b"
+        agent.base_url = "http://127.0.0.1:8080/v1"
+        agent._base_url_lower = "http://127.0.0.1:8080/v1"
+        agent._thinking_pad_cache = None
+        agent._needs_deepseek_tool_reasoning = lambda: False
+        agent._needs_kimi_tool_reasoning = lambda: False
+        agent._needs_mimo_tool_reasoning = lambda: False
+        return agent
+
+    def test_disabled_default_matches_strict_provider(self, monkeypatch):
+        # Default (false): a local llama.cpp endpoint is NOT an echo family,
+        # so reasoning_content is stripped — historical behavior.
+        agent = self._make_agent(False, monkeypatch)
+        assert agent._needs_thinking_reasoning_pad() is False
+
+    def test_enabled_preserves_reasoning_for_local_backend(self, monkeypatch):
+        # Toggle on: even a non-echo family (local llama.cpp) keeps
+        # reasoning_content on replay, protecting the KV-cache prefix.
+        agent = self._make_agent(True, monkeypatch)
+        assert agent._needs_thinking_reasoning_pad() is True
+
+    def test_enabled_does_not_break_echo_family(self, monkeypatch):
+        # DeepSeek/Kimi still get echo-back regardless of the toggle.
+        import hermes_cli.config as cfg
+        monkeypatch.setattr(
+            cfg, "load_config_readonly", lambda: {"model": {"reasoning_echo": False}})
+        agent = object.__new__(AIAgent)
+        agent.provider = "deepseek"
+        agent.model = "deepseek-v4-pro"
+        agent.base_url = "https://api.deepseek.com/v1"
+        agent._base_url_lower = "https://api.deepseek.com/v1"
+        agent._thinking_pad_cache = None
+        agent._needs_deepseek_tool_reasoning = lambda: True
+        agent._needs_kimi_tool_reasoning = lambda: False
+        agent._needs_mimo_tool_reasoning = lambda: False
+        assert agent._needs_thinking_reasoning_pad() is True
