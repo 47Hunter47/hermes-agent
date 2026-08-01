@@ -374,10 +374,19 @@ class TestReasoningEchoConfigToggle:
         agent._thinking_pad_cache = None  # invalidate per-provider cache
         assert agent._needs_thinking_reasoning_pad() is False  # strict: strip
         assert agent._preserve_reasoning_echo() is True  # toggle still on
-        # The combined replay gate used by copy_reasoning_content_for_api:
-        from agent.agent_runtime_helpers import copy_reasoning_content_for_api
-        api = {"role": "assistant", "content": "x", "reasoning_content": " "}
-        src = {"role": "assistant", "content": "x", "reasoning_content": " "}
-        copy_reasoning_content_for_api(agent, src, api)
-        # copy_reasoning_content_for_api is the replay path — toggle applies.
-        assert api.get("reasoning_content") == " "
+        # End-to-end fallback test: reapply_reasoning_echo_for_provider
+        # must strip reasoning_content from all assistant turns when
+        # falling back to a strict provider, even with the toggle on.
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+        api_msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "reasoning_content": "thoughts"},
+            {"role": "assistant", "content": "hi2", "reasoning_content": " "},
+            {"role": "user", "content": "bye"},
+        ]
+        changed = reapply_reasoning_echo_for_provider(agent, api_msgs)
+        assert changed == 2  # both assistant turns modified
+        for m in api_msgs:
+            if m["role"] == "assistant":
+                assert "reasoning_content" not in m, \
+                    "reapply_reasoning_echo_for_provider failed to strip for Mistral"
