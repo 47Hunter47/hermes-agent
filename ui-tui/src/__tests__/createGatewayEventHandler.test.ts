@@ -2146,4 +2146,88 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  describe('live context estimate (#18260)', () => {
+    const WINDOW = 150016
+
+    const authoritative = (used: number, calls = 1) => ({
+      calls,
+      context_max: WINDOW,
+      context_percent: Math.round((used / WINDOW) * 100),
+      context_used: used,
+      input: 0,
+      output: 0,
+      total: 0
+    })
+
+    it('advances the gauge while reasoning streams, before any API call completes', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { usage: authoritative(96000) }, type: 'session.info' } as any)
+      expect(getUiState().usage.context_used).toBe(96000)
+
+      // One long thinking phase: the server counters are frozen, only deltas flow.
+      onEvent({ payload: { text: 'x'.repeat(4000) }, type: 'reasoning.delta' } as any)
+
+      const est = estimateTokensRough('x'.repeat(4000))
+      expect(getUiState().usage.context_used).toBe(96000 + est)
+      expect(getUiState().usage.context_percent).toBe(
+        Math.max(0, Math.min(100, Math.round(((96000 + est) / WINDOW) * 100)))
+      )
+    })
+
+    it('does not reset the estimate on a frozen 1 Hz ticker re-emit', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { usage: authoritative(96000) }, type: 'session.info' } as any)
+      onEvent({ payload: { text: 'x'.repeat(4000) }, type: 'reasoning.delta' } as any)
+      const midTurn = getUiState().usage.context_used
+      expect(midTurn).toBeGreaterThan(96000)
+
+      // Ticker frame: context_used frozen, only the call counter moved.
+      onEvent({ payload: { usage: authoritative(96000, 2) }, type: 'session.usage' } as any)
+
+      expect(getUiState().usage.context_used).toBe(midTurn)
+    })
+
+    it('re-anchors on the authoritative message.complete usage', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { usage: authoritative(96000) }, type: 'session.info' } as any)
+      onEvent({ payload: { text: 'x'.repeat(4000) }, type: 'reasoning.delta' } as any)
+      onEvent({ payload: { text: 'y'.repeat(4000) }, type: 'message.delta' } as any)
+
+      // End of turn: the real provider reading supersedes the estimate.
+      onEvent({ payload: { text: 'done', usage: authoritative(98500, 2) }, type: 'message.complete' } as any)
+
+      const usage = getUiState().usage
+      expect(usage.context_used).toBe(98500)
+      expect(usage.context_percent).toBe(Math.round((98500 / WINDOW) * 100))
+    })
+
+    it('ignores thinking.delta status verbs and reasoning.available previews', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { usage: authoritative(96000) }, type: 'session.info' } as any)
+
+      // thinking.delta carries "🤔 Thinking..." verbs, not model output.
+      onEvent({ payload: { text: '🤔 Thinking...' }, type: 'thinking.delta' } as any)
+      // reasoning.available is a 500-char preview of already-streamed content.
+      onEvent({ payload: { text: 'x'.repeat(500) }, type: 'reasoning.available' } as any)
+
+      expect(getUiState().usage.context_used).toBe(96000)
+    })
+
+    it('counts message.interim text only once when it was already streamed', () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { usage: authoritative(96000) }, type: 'session.info' } as any)
+
+      onEvent({ payload: { text: 'z'.repeat(800) }, type: 'message.delta' } as any)
+      const afterDelta = getUiState().usage.context_used
+      // Same text re-delivered as interim with already_streamed — no double count.
+      onEvent({ payload: { already_streamed: true, text: 'z'.repeat(800) }, type: 'message.interim' } as any)
+      expect(getUiState().usage.context_used).toBe(afterDelta)
+    })
+  })
 })

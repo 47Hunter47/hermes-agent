@@ -27,6 +27,7 @@ import type { Msg, SubagentProgress, SubagentStatus, Usage } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
+import { addStreamedText, adoptAuthoritativeUsage, createLiveContextState, liveContextPatch } from './liveContextEstimate.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
@@ -430,6 +431,28 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
 
+  // Live context-window estimate (#18260): the gateway's 1 Hz session.usage
+  // ticker only advances when an API call completes, so during a long single
+  // thinking/response phase the gauge is frozen. The streamed deltas below
+  // estimate the in-flight tokens on top of the last authoritative reading.
+  // Display-only: every authoritative usage snapshot resets the estimate.
+  const liveCtx = createLiveContextState()
+
+  const refreshLiveContext = () => {
+    const patch = liveContextPatch(liveCtx, getUiState().usage)
+
+    if (patch) {
+      patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, patch) }))
+    }
+  }
+
+  const noteStreamedText = (text: string | undefined) => {
+    if (text) {
+      addStreamedText(liveCtx, text)
+      refreshLiveContext()
+    }
+  }
+
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
@@ -772,6 +795,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'session.info': {
         const info = ev.payload
 
+        // Authoritative snapshot (boot / session switch) — rebase the live
+        // estimate on it before the patch lands.
+        adoptAuthoritativeUsage(liveCtx, info.usage)
+
         patchUiState(state => ({
           ...state,
           info,
@@ -793,7 +820,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const usage = ev.payload?.usage
 
         if (usage) {
-          patchUiState(state => ({ ...state, usage: { ...state.usage, ...usage } }))
+          // Authoritative reading — the streamed estimate folds into it.
+          adoptAuthoritativeUsage(liveCtx, usage)
+          patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, usage) }))
+          // The authoritative patch overwrites context_used with the frozen
+          // counter; re-apply the overlay so the gauge keeps showing the
+          // in-flight estimate until the next authoritative change.
+          refreshLiveContext()
         }
 
         return
@@ -808,6 +841,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (text !== undefined) {
           const value = String(text)
+          // thinking.delta carries status verbs ("🤔 Thinking..."), not model
+          // output — the actual thinking streams via reasoning.delta.
           scheduleThinkingStatus(value || statusFromBusy())
 
           if (value) {
@@ -1101,12 +1136,15 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'reasoning.delta':
         if (ev.payload?.text) {
+          noteStreamedText(ev.payload.text)
           turnController.recordReasoningDelta(ev.payload.text, Boolean(ev.payload.verbose))
         }
 
         return
 
       case 'reasoning.available':
+        // reasoning.available is a 500-char preview of content that already
+        // streamed via reasoning.delta — counting it would double-count.
         turnController.recordReasoningAvailable(String(ev.payload?.text ?? ''), Boolean(ev.payload?.verbose))
 
         return
@@ -1169,6 +1207,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'tool.start':
         turnController.recordTodos(ev.payload.todos)
+        noteStreamedText(ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined)
         turnController.recordToolStart(
           ev.payload.tool_id,
           ev.payload.name ?? 'tool',
@@ -1408,6 +1447,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'message.delta':
+        noteStreamedText(ev.payload?.text)
         turnController.recordMessageDelta(ev.payload ?? {})
 
         return
@@ -1415,6 +1455,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const text = ev.payload?.text
 
         if (typeof text === 'string' && text.trim()) {
+          // already_streamed: the text already arrived via message.delta —
+          // adding it again would double-count the estimate.
+          if (!ev.payload?.already_streamed) {
+            noteStreamedText(text)
+          }
+
           turnController.recordInterimMessage(text)
         }
 
@@ -1439,6 +1485,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         setStatus('ready')
 
         if (ev.payload?.usage) {
+          // Authoritative end-of-turn reading — supersedes the live estimate.
+          adoptAuthoritativeUsage(liveCtx, ev.payload.usage)
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage) }))
         }
 
