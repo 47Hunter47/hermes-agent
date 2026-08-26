@@ -4,7 +4,8 @@ import {
   addStreamedText,
   adoptAuthoritativeUsage,
   createLiveContextState,
-  liveContextPatch
+  liveContextPatch,
+  resetLiveContext
 } from '../app/liveContextEstimate.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Usage } from '../types.js'
@@ -31,6 +32,16 @@ describe('liveContextEstimate', () => {
     adoptAuthoritativeUsage(state, usageWithWindow(96000))
     expect(state.base).toBe(96000)
     expect(state.streamed).toBe(0)
+  })
+
+  it('resets base and streamed on an explicit reset (session switch)', () => {
+    // session.info is the only point where a fresh window is guaranteed: the
+    // previous session's base must not survive into the new one.
+    const state = createLiveContextState()
+    adoptAuthoritativeUsage(state, usageWithWindow(140000))
+    addStreamedText(state, 'x'.repeat(4000))
+    resetLiveContext(state)
+    expect(state).toEqual({ base: null, streamed: 0 })
   })
 
   it('does NOT reset the estimate when context_used is unchanged (ticker re-emit)', () => {

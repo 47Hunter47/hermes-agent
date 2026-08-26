@@ -27,7 +27,7 @@ import type { Msg, SubagentProgress, SubagentStatus, Usage } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
-import { addStreamedText, adoptAuthoritativeUsage, createLiveContextState, liveContextPatch } from './liveContextEstimate.js'
+import { addStreamedText, adoptAuthoritativeUsage, createLiveContextState, liveContextPatch, resetLiveContext } from './liveContextEstimate.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
@@ -442,7 +442,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     const patch = liveContextPatch(liveCtx, getUiState().usage)
 
     if (patch) {
-      patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, patch) }))
+      // The gauge renders integer percents, but deltas arrive far faster than
+      // the percent moves (hundreds/sec on fast streams). Writing the store on
+      // every delta forced every $uiState subscriber — including the status
+      // rule — to re-render per chunk (#41480 class of churn). Gate on the
+      // percent actually changing: the token figure stays exact in the store,
+      // the visible bar updates at most once per whole-percent step.
+      const current = getUiState().usage
+      const samePercent = (patch.context_percent ?? current.context_percent) === current.context_percent
+
+      if (!samePercent) {
+        patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, patch) }))
+      }
     }
   }
 
@@ -795,8 +806,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'session.info': {
         const info = ev.payload
 
-        // Authoritative snapshot (boot / session switch) — rebase the live
-        // estimate on it before the patch lands.
+        // A session.info snapshot (boot, /new, session switch) is the only
+        // point where a fresh window is guaranteed — nothing could have
+        // streamed before it. Discard the previous session's estimate first,
+        // then rebase on this snapshot: a fresh session's `context_used` is
+        // 0 or absent, and the `used > 0` adoption guard would otherwise
+        // skip the re-anchor, leaving the OLD session's base rendered until
+        // the first API call completes.
+        resetLiveContext(liveCtx)
         adoptAuthoritativeUsage(liveCtx, info.usage)
 
         patchUiState(state => ({
@@ -1249,6 +1266,26 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.todos,
             resultText
           )
+        }
+
+        // Tool results are the largest context contributors in agentic loops
+        // (file reads, search hits, command output) — fold them into the live
+        // estimate so the gauge tracks growth during read-heavy phases instead
+        // of jumping at the turn-end re-anchor. `result` (the raw tool output)
+        // is always present; `result_text` is only sent in verbose mode and
+        // takes precedence there. The estimate is display-only: the
+        // authoritative message.complete usage re-anchors it at turn end, so
+        // any roughness here is transient.
+        const toolResultRaw =
+          resultText ??
+          (typeof ev.payload.result === 'string'
+            ? ev.payload.result
+            : ev.payload.result != null
+              ? JSON.stringify(ev.payload.result)
+              : undefined)
+
+        if (toolResultRaw) {
+          noteStreamedText(stripAnsi(toolResultRaw))
         }
 
         return

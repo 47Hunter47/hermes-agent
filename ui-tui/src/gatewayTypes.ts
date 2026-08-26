@@ -695,6 +695,7 @@ export type GatewayEvent =
         error?: string
         inline_diff?: string
         name?: string
+        result?: unknown
         result_text?: string
         summary?: string
         tool_id: string

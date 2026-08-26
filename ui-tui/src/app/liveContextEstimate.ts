@@ -11,14 +11,17 @@ import type { Usage } from '../types.js'
 // jumps in one step when the turn ends — observed as e.g. 60% -> 100% in a
 // single frame on llama.cpp + thinking models.
 //
-// The TUI already receives the streamed model output (thinking.delta /
-// reasoning.delta / message.delta / message.interim), so the in-flight
-// tokens are estimated client-side and added to the last authoritative
-// `context_used` reading. The estimate is a display-only overlay: every
-// authoritative reading (session.usage tick, message.complete usage,
-// session.info usage) replaces it — adoptAuthoritativeUsage() resets the
-// streamed counter because the next prompt already includes everything
-// streamed before that reading.
+// The TUI already receives the streamed model output (reasoning.delta /
+// message.delta / message.interim) and completed tool results, so the
+// in-flight tokens are estimated client-side and added to the last
+// authoritative `context_used` reading. Tool RESULTS are counted too
+// (tool.complete) — in agentic loops file reads, search hits, and command
+// output are the largest context contributors, and skipping them made the
+// gauge lag real growth until the turn-end re-anchor. The estimate is a
+// display-only overlay: every authoritative reading (session.usage tick,
+// message.complete usage, session.info usage) replaces it —
+// adoptAuthoritativeUsage() resets the streamed counter because the next
+// prompt already includes everything streamed before that reading.
 
 export interface LiveContextState {
   /**
@@ -32,6 +35,19 @@ export interface LiveContextState {
 }
 
 export const createLiveContextState = (): LiveContextState => ({ base: null, streamed: 0 })
+
+/**
+ * Discard any running estimate. A `session.info` snapshot (boot, /new,
+ * session switch) is the ONLY point where a fresh window is guaranteed:
+ * nothing could have streamed before it, so the previous session's base
+ * must not survive. Without this, a fresh session whose `context_used`
+ * reading is 0 (or absent) would keep rendering the OLD session's
+ * occupancy until its first API call completes.
+ */
+export const resetLiveContext = (state: LiveContextState): void => {
+  state.base = null
+  state.streamed = 0
+}
 
 /**
  * Adopt an authoritative usage snapshot as the new base. A reading that
