@@ -24,6 +24,9 @@ name: Install & Update E2E
 # so it is gated on releases and the clock instead.
 
 on:
+  # NOTE (fork): schedule trigger disabled — this workflow exists to test
+  # upstream releases; running it on a fork only produces CI noise.
+  # Re-enable by adding: schedule: - cron: '20 7,19 * * *'
   workflow_dispatch:
     inputs:
       route:
@@ -37,9 +40,6 @@ on:
         required: false
         type: string
         default: '5'
-  schedule:
-    # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
-    - cron: '20 7,19 * * *'
   push:
     tags:
       # Release tags only: the repo also carries backup/* and one-off tags.
